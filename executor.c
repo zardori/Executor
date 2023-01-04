@@ -1,9 +1,12 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <semaphore.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stdint-gcc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,31 +14,175 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <stdio.h>
-#include <semaphore.h>
 
-#include "utils.h"
 #include "err.h"
+#include "utils.h"
 
-const int MAX_INSTRUCTION_SIZE = 512;
+#define MAX_INSTRUCTION_SIZE 512
 
-const int MAX_TASKS = 4096;
+#define MAX_TASKS 4096
+
+// Size of the buffer used to read line from a task.
+#define LINE_BUFF_SIZE 1024
 
 struct Task {
 
-    // Descriptors which will be used to read from the task
+    // Variable used only to be referenced to in thread creation.
+    // It will be the same as index in task array.
+    int id;
+
+    int pid;
+
+    // Descriptors which will be used to read from the task.
     int stdout_desc;
     int stderr_desc;
 
+    // Place for threads which will handle task output reading.
+    pthread_t stdout_thread;
+    pthread_t stderr_thread;
+
+    char stdout_buff_1[LINE_BUFF_SIZE];
+    char stdout_buff_2[LINE_BUFF_SIZE];
+
+    char stderr_buff_1[LINE_BUFF_SIZE];
+    char stderr_buff_2[LINE_BUFF_SIZE];
+
+    char* which_stdout_to_print;
+    char* which_stderr_to_print;
+
+    sem_t stdout_buff_switch_mutex;
+    sem_t stderr_buff_switch_mutex;
 
 };
 
 
 struct Task tasks[MAX_TASKS];
 
-
-
 sem_t main_mutex;
+
+
+void taskStructInit(int task_num) {
+
+    tasks[task_num].id = task_num;
+
+    // fill first buffer with empty string
+    // and make it ready to print
+    tasks[task_num].stdout_buff_1[0] = '\0';
+    tasks[task_num].which_stdout_to_print = tasks[task_num].stdout_buff_1;
+
+    sem_init(&tasks[task_num].stdout_buff_switch_mutex, 0, 1);
+
+
+    // Same with stderr
+    tasks[task_num].stderr_buff_1[0] = '\0';
+    tasks[task_num].which_stderr_to_print = tasks[task_num].stderr_buff_1;
+
+    sem_init(&tasks[task_num].stderr_buff_switch_mutex, 0, 1);
+
+
+}
+
+
+void readerLoop(FILE* stream, char* which_to_write_to, char** which_to_print, sem_t* buff_switch_mutex) {
+
+    char* temp;
+
+    size_t chars_read;
+
+    while(read_line(which_to_write_to, LINE_BUFF_SIZE, stream)) {
+
+        chars_read = strlen(which_to_write_to);
+        assert(chars_read <= LINE_BUFF_SIZE - 2);
+
+        // Discard \n from the end of the string if it there
+        if (which_to_write_to[chars_read - 1] == '\n') {
+            which_to_write_to[chars_read - 1] = '\0';
+        }
+
+        sem_wait(buff_switch_mutex);
+
+        // swap buffers
+        temp = *which_to_print;
+        *which_to_print = which_to_write_to;
+        which_to_write_to = temp;
+
+        sem_post(buff_switch_mutex);
+
+    }
+
+
+}
+
+
+void* stderrReaderMain(void* task_num_ptr) {
+
+    int task_num = *(int*)task_num_ptr;
+
+    char* which_to_write_to = tasks[task_num].stderr_buff_2;
+
+    FILE* stream = fdopen(tasks[task_num].stderr_desc, "r");
+
+    readerLoop(stream, which_to_write_to, &tasks[task_num].which_stderr_to_print,
+        &tasks[task_num].stderr_buff_switch_mutex);
+
+    // If we are here, it means that EOF was reached.
+    fclose(stream);
+
+}
+
+
+void* stdoutReaderMain(void* task_num_ptr) {
+
+    int task_num = *(int*)task_num_ptr;
+
+    char* which_to_write_to = tasks[task_num].stdout_buff_2;
+
+    FILE* stream = fdopen(tasks[task_num].stdout_desc, "r");
+
+    readerLoop(stream, which_to_write_to, &tasks[task_num].which_stdout_to_print,
+        &tasks[task_num].stdout_buff_switch_mutex);
+
+
+    /*
+
+    char* temp;
+
+    size_t chars_read;
+
+    while(read_line(which_to_write_to, LINE_BUFF_SIZE, stream)) {
+
+        chars_read = strlen(which_to_write_to);
+        assert(chars_read <= LINE_BUFF_SIZE - 2);
+
+        // Add \n if it isn't present add the end of the string
+        if (which_to_write_to[chars_read - 1] != '\n') {
+            which_to_write_to[chars_read - 1] = '\n';
+            which_to_write_to[chars_read] = '\0';
+        }
+
+        sem_wait(&tasks[task_num].buff_switch_mutex);
+
+        // swap buffers
+        temp = tasks[task_num].which_to_print;
+        tasks[task_num].which_to_print = which_to_write_to;
+        which_to_write_to = temp;
+
+        sem_post(&tasks[task_num].buff_switch_mutex);
+
+    }
+
+     */
+
+
+    // If we are here it means that EOF was reached
+    fclose(stream);
+
+
+
+
+}
+
+
 
 
 void handleRun(const char* program_and_args) {
@@ -80,6 +227,9 @@ void handleRun(const char* program_and_args) {
     int stderr_write_desc = descriptors[1];
 
 
+    // Additional initialisation.
+    taskStructInit(curr_task_num);
+
 
     pid = fork();
     ASSERT_SYS_OK(pid);
@@ -100,6 +250,15 @@ void handleRun(const char* program_and_args) {
 
     }
 
+    // Parent process
+
+    // start reading threads
+    pthread_create(&tasks[curr_task_num].stdout_thread, NULL, stdoutReaderMain,
+        &tasks[curr_task_num].id);
+
+    // pid variable should contain pid of newly created child
+    tasks[curr_task_num].pid = pid;
+
     // Close write descriptors, because the executor process will only read from
     // the created pipes.
     close(stdout_write_desc);
@@ -116,6 +275,18 @@ void handleOut(const char* program_number) {
 
     fprintf(stderr, "Started handling out command with args: \"%s\" \n", program_number);
 
+    int task_num;
+
+    sscanf(program_number, "%d", &task_num);
+
+    assert(task_num >= 0 && task_num < 4096);
+
+
+    sem_wait(&tasks[task_num].stdout_buff_switch_mutex);
+
+    printf("Task %d stdout: '%s'.\n", task_num, tasks[task_num].which_stdout_to_print);
+
+    sem_post(&tasks[task_num].stdout_buff_switch_mutex);
 
 
     fprintf(stderr, "Ended handling out command with args: \"%s\" \n", program_number);
@@ -128,6 +299,22 @@ void handleErr(const char* program_number) {
     fprintf(stderr, "Started handling err command with args: \"%s\" \n", program_number);
 
 
+    int task_num;
+
+    sscanf(program_number, "%d", &task_num);
+
+    assert(task_num >= 0 && task_num < 4096);
+
+
+    sem_wait(&tasks[task_num].stderr_buff_switch_mutex);
+
+    printf("Task %d stderr: '%s'.\n", task_num, tasks[task_num].which_stderr_to_print);
+
+    sem_post(&tasks[task_num].stderr_buff_switch_mutex);
+
+
+
+
 
     fprintf(stderr, "Ended handling err command with args: \"%s\" \n", program_number);
 
@@ -137,7 +324,14 @@ void handleKill(const char* program_number) {
 
     fprintf(stderr, "Started handling kill command with args: \"%s\" \n", program_number);
 
+    int task_num;
+    
+    sscanf(program_number, "%d", &task_num);
 
+    assert(task_num >= 0 && task_num < 4096);
+    
+    kill(tasks[task_num].pid, SIGKILL);
+    
 
     fprintf(stderr, "Ended handling kill command with args: \"%s\" \n", program_number);
 
@@ -147,9 +341,10 @@ void handleSleep(const char* time) {
 
     fprintf(stderr, "Started handling sleep command with args: \"%s\" \n", time);
 
-    int seconds = 0;
-    sscanf(time, "%d", seconds);
-    sleep(seconds);
+
+    int milliseconds = 0;
+    sscanf(time, "%d", &milliseconds);
+    usleep(milliseconds * 1000);
 
     fprintf(stderr, "Ended handling sleep command with args: \"%s\" \n", time);
 
