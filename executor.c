@@ -60,6 +60,68 @@ struct Task tasks[MAX_TASKS];
 
 sem_t main_mutex;
 
+bool handling_command;
+
+/*
+void* signalListenerMain(void* args) {
+
+
+    sigset_t signals_to_wait_for;
+    sigemptyset(&signals_to_wait_for);
+    sigaddset(&signals_to_wait_for, SIGINT);
+    sigaddset(&signals_to_wait_for, SIGCHLD);
+
+    // Block signals to ensure we don't handle them with default handlers between waits.
+    ASSERT_SYS_OK(sigprocmask(SIG_BLOCK, &signals_to_wait_for, NULL));
+
+    int status;
+
+    siginfo_t info;
+
+    while (true) {
+        sigwaitinfo(&signals_to_wait_for, &info);
+
+        //printf("Parent: got signal >>%s<< from %d\n", strsignal(info.si_signo), info.si_pid);
+
+        if (info.si_signo == SIGCHLD) {
+            // If we received SIGCHLD we can know that process with pid info.si_pid ended.
+
+            sem_wait(&main_mutex);
+
+            if (handling_command == true) {
+
+            } else {
+
+            }
+
+            waitpid(info.si_pid, &status, 0);
+
+            sem_post(&main_mutex);
+
+        }
+        else // info.si_signo == SIGINT
+        {
+            break;
+        }
+
+    }
+
+
+}
+
+*/
+
+
+
+void printTaskEndMessage(int task_num, int status) {
+    if (WIFEXITED(status)) {
+        printf("Task %d ended: status %d.\n", task_num, WEXITSTATUS(status));
+    } else {
+        printf("Task %d ended: signalled.\n", task_num);
+    }
+}
+
+
 
 void taskStructInit(int task_num) {
 
@@ -128,6 +190,8 @@ void* stderrReaderMain(void* task_num_ptr) {
     // If we are here, it means that EOF was reached.
     fclose(stream);
 
+
+
 }
 
 
@@ -142,6 +206,25 @@ void* stdoutReaderMain(void* task_num_ptr) {
     readerLoop(stream, which_to_write_to, &tasks[task_num].which_stdout_to_print,
         &tasks[task_num].stdout_buff_switch_mutex);
 
+    // If we are here it means that EOF was reached
+    fclose(stream);
+
+
+    // Wait for the task termination to print information about exit status.
+    int status;
+    waitpid(tasks[task_num].pid, &status, 0);
+
+    sem_wait(&main_mutex);
+
+    if (handling_command) {
+
+        // TODO: mark the task to be printed after handling the command
+
+    } else {
+        printTaskEndMessage(task_num, status);
+    }
+
+    sem_post(&main_mutex);
 
     /*
 
@@ -174,8 +257,6 @@ void* stdoutReaderMain(void* task_num_ptr) {
      */
 
 
-    // If we are here it means that EOF was reached
-    fclose(stream);
 
 
 
@@ -256,6 +337,10 @@ void handleRun(const char* program_and_args) {
     pthread_create(&tasks[curr_task_num].stdout_thread, NULL, stdoutReaderMain,
         &tasks[curr_task_num].id);
 
+    pthread_create(&tasks[curr_task_num].stderr_thread, NULL, stderrReaderMain,
+        &tasks[curr_task_num].id);
+
+
     // pid variable should contain pid of newly created child
     tasks[curr_task_num].pid = pid;
 
@@ -313,9 +398,6 @@ void handleErr(const char* program_number) {
     sem_post(&tasks[task_num].stderr_buff_switch_mutex);
 
 
-
-
-
     fprintf(stderr, "Ended handling err command with args: \"%s\" \n", program_number);
 
 }
@@ -330,7 +412,7 @@ void handleKill(const char* program_number) {
 
     assert(task_num >= 0 && task_num < 4096);
     
-    kill(tasks[task_num].pid, SIGKILL);
+    kill(tasks[task_num].pid, SIGINT);
     
 
     fprintf(stderr, "Ended handling kill command with args: \"%s\" \n", program_number);
@@ -400,6 +482,7 @@ int main() {
 
     sem_init(&main_mutex, 0, 1);
 
+    handling_command = false;
 
 
     char buffer[MAX_INSTRUCTION_SIZE];
@@ -412,10 +495,21 @@ int main() {
 
         sem_wait(&main_mutex);
 
-        // handle command
-
+        handling_command = true;
 
         sem_post(&main_mutex);
+
+
+        // handle command
+
+        sem_wait(&main_mutex);
+
+        handling_command = false;
+
+        // TODO: print info about tasks that ended during handling command
+
+        sem_post(&main_mutex);
+
 
 
 
