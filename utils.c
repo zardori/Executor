@@ -70,6 +70,8 @@ bool read_line(char* buffer, size_t size_of_buffer, FILE* file)
             syserr("Getline failed.");
         assert(feof(file));
         buffer[0] = '\0';
+        // getline, if passed NULL, allocates memory which still must be freed in case of error
+        free(line);
         return false;
     }
 

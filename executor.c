@@ -34,7 +34,8 @@ struct Task {
 
     int pid;
 
-    atomic_bool finished;
+    bool finished;
+    sem_t finished_flag_mutex;
 
     // Descriptors which will be used to read from the task.
     int stdout_desc;
@@ -112,6 +113,8 @@ void taskStructInit(int task_num) {
 
     tasks[task_num].finished = false;
 
+    sem_init(&tasks[task_num].finished_flag_mutex, 0, 1);
+
     // fill first buffer with empty string
     // and make it ready to print
     tasks[task_num].stdout_buff_1[0] = '\0';
@@ -169,13 +172,45 @@ void* stderrReaderMain(void* task_num_ptr) {
 
     FILE* stream = fdopen(tasks[task_num].stderr_desc, "r");
 
+    /*
     readerLoop(stream, which_to_write_to, &tasks[task_num].which_stderr_to_print,
         &tasks[task_num].stderr_buff_switch_mutex);
+    */
+
+    char* temp;
+
+    size_t chars_read;
+
+    while(read_line(which_to_write_to, LINE_BUFF_SIZE, stream)) {
+
+        chars_read = strlen(which_to_write_to);
+        assert(chars_read <= LINE_BUFF_SIZE - 2);
+
+        // Discard \n from the end of the string if it there
+        if (which_to_write_to[chars_read - 1] == '\n') {
+            which_to_write_to[chars_read - 1] = '\0';
+        }
+
+        sem_wait(&(tasks[task_num].stderr_buff_switch_mutex));
+
+        // swap buffers
+        temp = tasks[task_num].which_stderr_to_print;
+        tasks[task_num].which_stderr_to_print = which_to_write_to;
+        which_to_write_to = temp;
+
+        sem_post(&(tasks[task_num].stderr_buff_switch_mutex));
+
+    }
+
+
+
 
     // If we are here, it means that EOF was reached.
     fclose(stream);
 
-    sem_destroy(&tasks[task_num].stderr_buff_switch_mutex);
+    //sem_destroy(&tasks[task_num].stderr_buff_switch_mutex);
+
+    return NULL;
 
 }
 
@@ -198,7 +233,10 @@ void* stdoutReaderMain(void* task_num_ptr) {
     // Wait for the task termination to print information about exit status.
     int status;
     waitpid(tasks[task_num].pid, &status, 0);
+
+    sem_wait(&tasks[task_num].finished_flag_mutex);
     tasks[task_num].finished = true;
+    sem_post(&tasks[task_num].finished_flag_mutex);
 
     sem_wait(&main_mutex);
 
@@ -214,8 +252,10 @@ void* stdoutReaderMain(void* task_num_ptr) {
 
     sem_post(&main_mutex);
 
-    sem_destroy(&tasks[task_num].stdout_buff_switch_mutex);
+    //sem_destroy(&tasks[task_num].stdout_buff_switch_mutex);
 
+
+    return NULL;
 
 }
 
@@ -224,8 +264,6 @@ void* stdoutReaderMain(void* task_num_ptr) {
 
 void handleRun(const char* program_and_args) {
 
-
-    //fprintf(stderr, "Started handling run command with args: \"%s\" \n", program_and_args);
 
     // Assume there will be at most MAX_TASKS programs to run.
     curr_task_num++;
@@ -243,7 +281,7 @@ void handleRun(const char* program_and_args) {
     int descriptors[2];
 
     // for stdout
-    pipe(descriptors);
+    ASSERT_SYS_OK(pipe(descriptors));
 
     set_close_on_exec(descriptors[0], true);
     set_close_on_exec(descriptors[1], true);
@@ -253,7 +291,7 @@ void handleRun(const char* program_and_args) {
     int stdout_write_desc = descriptors[1];
 
     // for stderr
-    pipe(descriptors);
+    ASSERT_SYS_OK(pipe(descriptors));
 
     set_close_on_exec(descriptors[0], true);
     set_close_on_exec(descriptors[1], true);
@@ -288,6 +326,10 @@ void handleRun(const char* program_and_args) {
 
     // Parent process
 
+
+    // pid variable should contain pid of newly created child
+    tasks[curr_task_num].pid = pid;
+
     // start reading threads
     pthread_create(&tasks[curr_task_num].stdout_thread, NULL, stdoutReaderMain,
         &tasks[curr_task_num].id);
@@ -295,9 +337,6 @@ void handleRun(const char* program_and_args) {
     pthread_create(&tasks[curr_task_num].stderr_thread, NULL, stderrReaderMain,
         &tasks[curr_task_num].id);
 
-
-    // pid variable should contain pid of newly created child
-    tasks[curr_task_num].pid = pid;
 
     // Close write descriptors, because the executor process will only read from
     // the created pipes.
@@ -308,14 +347,11 @@ void handleRun(const char* program_and_args) {
 
     printTaskStartMessage(curr_task_num, pid);
 
-    //fprintf(stderr, "Ended handling run command with args: \"%s\" \n", program_and_args);
 
 }
 
 
 void handleOut(const char* program_number) {
-
-    //fprintf(stderr, "Started handling out command with args: \"%s\" \n", program_number);
 
     int task_num;
 
@@ -330,16 +366,11 @@ void handleOut(const char* program_number) {
 
     sem_post(&tasks[task_num].stdout_buff_switch_mutex);
 
-
-    //fprintf(stderr, "Ended handling out command with args: \"%s\" \n", program_number);
-
 }
 
 
 void handleErr(const char* program_number) {
 
-    //fprintf(stderr, "Started handling err command with args: \"%s\" \n", program_number);
-
 
     int task_num;
 
@@ -348,20 +379,18 @@ void handleErr(const char* program_number) {
     assert(task_num >= 0 && task_num < 4096);
 
 
-    sem_wait(&tasks[task_num].stderr_buff_switch_mutex);
+    sem_wait(&(tasks[task_num].stderr_buff_switch_mutex));
 
     printf("Task %d stderr: '%s'.\n", task_num, tasks[task_num].which_stderr_to_print);
 
-    sem_post(&tasks[task_num].stderr_buff_switch_mutex);
+    sem_post(&(tasks[task_num].stderr_buff_switch_mutex));
 
 
-    //fprintf(stderr, "Ended handling err command with args: \"%s\" \n", program_number);
 
 }
 
 void handleKill(const char* program_number) {
 
-    //fprintf(stderr, "Started handling kill command with args: \"%s\" \n", program_number);
 
     int task_num;
     
@@ -369,45 +398,56 @@ void handleKill(const char* program_number) {
 
     assert(task_num >= 0 && task_num < 4096);
 
+
+    sem_wait(&tasks[task_num].finished_flag_mutex);
     if (!tasks[task_num].finished) {
         kill(tasks[task_num].pid, SIGINT);
     }
-    
+    sem_post(&tasks[task_num].finished_flag_mutex);
 
-    //fprintf(stderr, "Ended handling kill command with args: \"%s\" \n", program_number);
 
 }
 
 void handleSleep(const char* time) {
-
-    //fprintf(stderr, "Started handling sleep command with args: \"%s\" \n", time);
 
 
     int milliseconds = 0;
     sscanf(time, "%d", &milliseconds);
     usleep(milliseconds * 1000);
 
-    //fprintf(stderr, "Ended handling sleep command with args: \"%s\" \n", time);
 
 }
 
 void handleQuit() {
 
-    //fprintf(stderr, "Started handling quit command.");
 
     // Kill all unfinished tasks.
     for (int i = 0; i <= curr_task_num; i++) {
+        sem_wait(&tasks[i].finished_flag_mutex);
         if (!tasks[i].finished) {
             kill(tasks[i].pid, SIGKILL);
         }
+        sem_post(&tasks[i].finished_flag_mutex);
+
         pthread_join(tasks[i].stdout_thread, NULL);
         pthread_join(tasks[i].stderr_thread, NULL);
+
+        sem_destroy(&tasks[i].finished_flag_mutex);
+        sem_destroy(&tasks[i].stdout_buff_switch_mutex);
+        sem_destroy(&tasks[i].stderr_buff_switch_mutex);
     }
 
-    //fprintf(stderr, "Ended handling quit command.");
+
+    // Print info about tasks that ended during handling this command.
+    for (int i = 0; i < ended_to_be_printed.size; i++) {
+        printTaskEndMessage(ended_to_be_printed.tasks_arr[i].task_num,
+            ended_to_be_printed.tasks_arr[i].status);
+    }
+    ended_to_be_printed.size = 0;
+
+    sem_destroy(&main_mutex);
 
     exit(0);
-
 
 }
 
@@ -421,8 +461,13 @@ void handleInstruction(const char* instruction) {
     int command_len = (int)strlen(command);
 
     // Calculate pointer to the next part of the instruction.
-    // Add 1 for the single space between the keyword (command) and its arguments.
-    const char* further_instruction_ptr = instruction + command_len + 1;
+    const char* further_instruction_ptr = instruction + command_len;
+
+    // Skip spaces between command and arguments.
+    while(*further_instruction_ptr == ' ') {
+        further_instruction_ptr++;
+    }
+
 
     if (strcmp(command, "run") == 0) {
         handleRun(further_instruction_ptr);
@@ -458,17 +503,6 @@ int main() {
 
     size_t size = INSTRUCTION_BUFFER_SIZE;
 
-/*
-    if (getline(&buff_ptr, &size, stdin) == -1) {
-        printf("error in reading the line\n");
-    }
-
-    printf("\n");
-
-    printf("%s", buffer);
-
-    printf("\n Hello world\n");
-*/
 
     ssize_t chars_read;
 
@@ -519,7 +553,5 @@ int main() {
         sem_post(&main_mutex);
     }
 
-
-    handleQuit();
 
 }
