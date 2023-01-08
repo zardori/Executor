@@ -172,43 +172,14 @@ void* stderrReaderMain(void* task_num_ptr) {
 
     FILE* stream = fdopen(tasks[task_num].stderr_desc, "r");
 
-    /*
+
     readerLoop(stream, which_to_write_to, &tasks[task_num].which_stderr_to_print,
         &tasks[task_num].stderr_buff_switch_mutex);
-    */
-
-    char* temp;
-
-    size_t chars_read;
-
-    while(read_line(which_to_write_to, LINE_BUFF_SIZE, stream)) {
-
-        chars_read = strlen(which_to_write_to);
-        assert(chars_read <= LINE_BUFF_SIZE - 2);
-
-        // Discard \n from the end of the string if it there
-        if (which_to_write_to[chars_read - 1] == '\n') {
-            which_to_write_to[chars_read - 1] = '\0';
-        }
-
-        sem_wait(&(tasks[task_num].stderr_buff_switch_mutex));
-
-        // swap buffers
-        temp = tasks[task_num].which_stderr_to_print;
-        tasks[task_num].which_stderr_to_print = which_to_write_to;
-        which_to_write_to = temp;
-
-        sem_post(&(tasks[task_num].stderr_buff_switch_mutex));
-
-    }
-
-
 
 
     // If we are here, it means that EOF was reached.
     fclose(stream);
 
-    //sem_destroy(&tasks[task_num].stderr_buff_switch_mutex);
 
     return NULL;
 
@@ -252,7 +223,6 @@ void* stdoutReaderMain(void* task_num_ptr) {
 
     sem_post(&main_mutex);
 
-    //sem_destroy(&tasks[task_num].stdout_buff_switch_mutex);
 
 
     return NULL;
