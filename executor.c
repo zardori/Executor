@@ -14,11 +14,12 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <stdatomic.h>
 
 #include "err.h"
 #include "utils.h"
 
-#define MAX_INSTRUCTION_SIZE 512
+#define INSTRUCTION_BUFFER_SIZE 512
 
 #define MAX_TASKS 4096
 
@@ -32,6 +33,8 @@ struct Task {
     int id;
 
     int pid;
+
+    atomic_bool finished;
 
     // Descriptors which will be used to read from the task.
     int stdout_desc;
@@ -55,62 +58,42 @@ struct Task {
 
 };
 
+struct TaskAndStatus{
+    int task_num;
+    int status;
+};
+
+
+struct TaskList {
+    struct TaskAndStatus tasks_arr[MAX_TASKS];
+    int size;
+};
+
+
 
 struct Task tasks[MAX_TASKS];
 
 sem_t main_mutex;
 
+int curr_task_num;
+
 bool handling_command;
 
-/*
-void* signalListenerMain(void* args) {
+struct TaskList ended_to_be_printed;
 
 
-    sigset_t signals_to_wait_for;
-    sigemptyset(&signals_to_wait_for);
-    sigaddset(&signals_to_wait_for, SIGINT);
-    sigaddset(&signals_to_wait_for, SIGCHLD);
 
-    // Block signals to ensure we don't handle them with default handlers between waits.
-    ASSERT_SYS_OK(sigprocmask(SIG_BLOCK, &signals_to_wait_for, NULL));
+void addToEndedList(int task_num, int status) {
+    ended_to_be_printed.tasks_arr[ended_to_be_printed.size].task_num = task_num;
+    ended_to_be_printed.tasks_arr[ended_to_be_printed.size].status = status;
 
-    int status;
-
-    siginfo_t info;
-
-    while (true) {
-        sigwaitinfo(&signals_to_wait_for, &info);
-
-        //printf("Parent: got signal >>%s<< from %d\n", strsignal(info.si_signo), info.si_pid);
-
-        if (info.si_signo == SIGCHLD) {
-            // If we received SIGCHLD we can know that process with pid info.si_pid ended.
-
-            sem_wait(&main_mutex);
-
-            if (handling_command == true) {
-
-            } else {
-
-            }
-
-            waitpid(info.si_pid, &status, 0);
-
-            sem_post(&main_mutex);
-
-        }
-        else // info.si_signo == SIGINT
-        {
-            break;
-        }
-
-    }
-
-
+    ended_to_be_printed.size++;
 }
 
-*/
 
+void printTaskStartMessage(int task_num, pid_t pid) {
+    printf("Task %d started: pid %ld.\n", task_num, (long)pid);
+}
 
 
 void printTaskEndMessage(int task_num, int status) {
@@ -126,6 +109,8 @@ void printTaskEndMessage(int task_num, int status) {
 void taskStructInit(int task_num) {
 
     tasks[task_num].id = task_num;
+
+    tasks[task_num].finished = false;
 
     // fill first buffer with empty string
     // and make it ready to print
@@ -190,7 +175,7 @@ void* stderrReaderMain(void* task_num_ptr) {
     // If we are here, it means that EOF was reached.
     fclose(stream);
 
-
+    sem_destroy(&tasks[task_num].stderr_buff_switch_mutex);
 
 }
 
@@ -213,12 +198,15 @@ void* stdoutReaderMain(void* task_num_ptr) {
     // Wait for the task termination to print information about exit status.
     int status;
     waitpid(tasks[task_num].pid, &status, 0);
+    tasks[task_num].finished = true;
 
     sem_wait(&main_mutex);
 
     if (handling_command) {
 
-        // TODO: mark the task to be printed after handling the command
+        // If we are currently handling command just add task_num and its exit status
+        // to the list. It will be printed by main thread when the command is finished.
+        addToEndedList(task_num, status);
 
     } else {
         printTaskEndMessage(task_num, status);
@@ -226,39 +214,7 @@ void* stdoutReaderMain(void* task_num_ptr) {
 
     sem_post(&main_mutex);
 
-    /*
-
-    char* temp;
-
-    size_t chars_read;
-
-    while(read_line(which_to_write_to, LINE_BUFF_SIZE, stream)) {
-
-        chars_read = strlen(which_to_write_to);
-        assert(chars_read <= LINE_BUFF_SIZE - 2);
-
-        // Add \n if it isn't present add the end of the string
-        if (which_to_write_to[chars_read - 1] != '\n') {
-            which_to_write_to[chars_read - 1] = '\n';
-            which_to_write_to[chars_read] = '\0';
-        }
-
-        sem_wait(&tasks[task_num].buff_switch_mutex);
-
-        // swap buffers
-        temp = tasks[task_num].which_to_print;
-        tasks[task_num].which_to_print = which_to_write_to;
-        which_to_write_to = temp;
-
-        sem_post(&tasks[task_num].buff_switch_mutex);
-
-    }
-
-     */
-
-
-
-
+    sem_destroy(&tasks[task_num].stdout_buff_switch_mutex);
 
 
 }
@@ -269,10 +225,9 @@ void* stdoutReaderMain(void* task_num_ptr) {
 void handleRun(const char* program_and_args) {
 
 
-    fprintf(stderr, "Started handling run command with args: \"%s\" \n", program_and_args);
+    //fprintf(stderr, "Started handling run command with args: \"%s\" \n", program_and_args);
 
     // Assume there will be at most MAX_TASKS programs to run.
-    static int curr_task_num = -1;
     curr_task_num++;
     assert(curr_task_num < MAX_TASKS);
 
@@ -351,18 +306,20 @@ void handleRun(const char* program_and_args) {
 
     free_split_string(split_str);
 
-    fprintf(stderr, "Ended handling run command with args: \"%s\" \n", program_and_args);
+    printTaskStartMessage(curr_task_num, pid);
+
+    //fprintf(stderr, "Ended handling run command with args: \"%s\" \n", program_and_args);
 
 }
 
 
 void handleOut(const char* program_number) {
 
-    fprintf(stderr, "Started handling out command with args: \"%s\" \n", program_number);
+    //fprintf(stderr, "Started handling out command with args: \"%s\" \n", program_number);
 
     int task_num;
 
-    sscanf(program_number, "%d", &task_num);
+    ASSERT_SYS_OK(sscanf(program_number, "%d", &task_num));
 
     assert(task_num >= 0 && task_num < 4096);
 
@@ -374,19 +331,19 @@ void handleOut(const char* program_number) {
     sem_post(&tasks[task_num].stdout_buff_switch_mutex);
 
 
-    fprintf(stderr, "Ended handling out command with args: \"%s\" \n", program_number);
+    //fprintf(stderr, "Ended handling out command with args: \"%s\" \n", program_number);
 
 }
 
 
 void handleErr(const char* program_number) {
 
-    fprintf(stderr, "Started handling err command with args: \"%s\" \n", program_number);
+    //fprintf(stderr, "Started handling err command with args: \"%s\" \n", program_number);
 
 
     int task_num;
 
-    sscanf(program_number, "%d", &task_num);
+    ASSERT_SYS_OK(sscanf(program_number, "%d", &task_num));
 
     assert(task_num >= 0 && task_num < 4096);
 
@@ -398,47 +355,59 @@ void handleErr(const char* program_number) {
     sem_post(&tasks[task_num].stderr_buff_switch_mutex);
 
 
-    fprintf(stderr, "Ended handling err command with args: \"%s\" \n", program_number);
+    //fprintf(stderr, "Ended handling err command with args: \"%s\" \n", program_number);
 
 }
 
 void handleKill(const char* program_number) {
 
-    fprintf(stderr, "Started handling kill command with args: \"%s\" \n", program_number);
+    //fprintf(stderr, "Started handling kill command with args: \"%s\" \n", program_number);
 
     int task_num;
     
-    sscanf(program_number, "%d", &task_num);
+    ASSERT_SYS_OK(sscanf(program_number, "%d", &task_num));
 
     assert(task_num >= 0 && task_num < 4096);
-    
-    kill(tasks[task_num].pid, SIGINT);
+
+    if (!tasks[task_num].finished) {
+        kill(tasks[task_num].pid, SIGINT);
+    }
     
 
-    fprintf(stderr, "Ended handling kill command with args: \"%s\" \n", program_number);
+    //fprintf(stderr, "Ended handling kill command with args: \"%s\" \n", program_number);
 
 }
 
 void handleSleep(const char* time) {
 
-    fprintf(stderr, "Started handling sleep command with args: \"%s\" \n", time);
+    //fprintf(stderr, "Started handling sleep command with args: \"%s\" \n", time);
 
 
     int milliseconds = 0;
     sscanf(time, "%d", &milliseconds);
     usleep(milliseconds * 1000);
 
-    fprintf(stderr, "Ended handling sleep command with args: \"%s\" \n", time);
+    //fprintf(stderr, "Ended handling sleep command with args: \"%s\" \n", time);
 
 }
 
 void handleQuit() {
 
-    fprintf(stderr, "Started handling quit command.");
+    //fprintf(stderr, "Started handling quit command.");
 
+    // Kill all unfinished tasks.
+    for (int i = 0; i <= curr_task_num; i++) {
+        if (!tasks[i].finished) {
+            kill(tasks[i].pid, SIGKILL);
+        }
+        pthread_join(tasks[i].stdout_thread, NULL);
+        pthread_join(tasks[i].stderr_thread, NULL);
+    }
 
+    //fprintf(stderr, "Ended handling quit command.");
 
-    fprintf(stderr, "Ended handling quit command.");
+    exit(0);
+
 
 }
 
@@ -469,13 +438,10 @@ void handleInstruction(const char* instruction) {
         handleQuit();
     } else {
         fprintf(stderr, "Wrong command.\n");
+        exit(EXIT_FAILURE);
     }
 
-
-
 }
-
-
 
 
 int main() {
@@ -484,14 +450,47 @@ int main() {
 
     handling_command = false;
 
+    curr_task_num = -1;
 
-    char buffer[MAX_INSTRUCTION_SIZE];
+    char buffer[INSTRUCTION_BUFFER_SIZE];
 
+    char *buff_ptr = buffer;
+
+    size_t size = INSTRUCTION_BUFFER_SIZE;
+
+/*
+    if (getline(&buff_ptr, &size, stdin) == -1) {
+        printf("error in reading the line\n");
+    }
+
+    printf("\n");
+
+    printf("%s", buffer);
+
+    printf("\n Hello world\n");
+*/
+
+    ssize_t chars_read;
+
+    bool quit = false;
 
     // main loop
     while (true) {
 
-        fgets(buffer, MAX_INSTRUCTION_SIZE, stdin);
+        chars_read = getline(&buff_ptr, &size, stdin);
+
+        if (chars_read == -1) {
+            // EOF encountered
+            quit = true;
+        } else if (buff_ptr[chars_read - 1] == '\n') {
+            if (chars_read == 1) {
+                // If there is single '\n', continue to the next instruction
+                continue;
+            } else {
+                // remove '\n' from the end of the string
+                buff_ptr[chars_read - 1] = '\0';
+            }
+        }
 
         sem_wait(&main_mutex);
 
@@ -499,43 +498,28 @@ int main() {
 
         sem_post(&main_mutex);
 
-
-        // handle command
+        if (quit) {
+            handleQuit();
+        } else {
+            handleInstruction(buff_ptr);
+        }
 
         sem_wait(&main_mutex);
 
         handling_command = false;
 
-        // TODO: print info about tasks that ended during handling command
+        // Print info about tasks that ended during handling command.
+        for (int i = 0; i < ended_to_be_printed.size; i++) {
+            printTaskEndMessage(ended_to_be_printed.tasks_arr[i].task_num,
+                ended_to_be_printed.tasks_arr[i].status);
+        }
+        ended_to_be_printed.size = 0;
+
 
         sem_post(&main_mutex);
-
-
-
-
-/*
-        scanf("%s", command);
-
-        if (strcmp(command, "run") == 0) {
-
-        } else if (strcmp(command, "out") == 0) {
-
-        } else if (strcmp(command, "err") == 0) {
-
-        } else if (strcmp(command, "kill") == 0) {
-
-        } else if (strcmp(command, "sleep") == 0) {
-
-        } else if (strcmp(command, "quit") == 0) {
-
-        } else {
-            fprintf(stderr, "Wrong command.\n");
-        }
-*/
     }
 
 
+    handleQuit();
 
-
-    return 0;
 }
